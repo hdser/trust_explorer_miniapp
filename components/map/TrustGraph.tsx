@@ -48,7 +48,6 @@ function rgb01(hex: string): [number, number, number] {
 const ROUTE_RGB = rgb01(PATH_HEX);
 const CENTER_RGB = rgb01(CENTER_HEX);
 const NEW_RGB = rgb01(NEW_HEX);
-const SPACE_CENTER = 4096;
 
 // Force presets, applied per graph size on a from-scratch layout. The ego graph is a ~220-leaf
 // star that wants weak centering + long links to bloom into an airy radial cloud. The global
@@ -97,6 +96,18 @@ function cosmosGl(): any {
   return (window as unknown as { cosmosgl?: { Graph: unknown } }).cosmosgl;
 }
 
+// The simulation domain cosmos ACTUALLY uses. cosmos silently halves the requested `spaceSize` to
+// maxTextureSize/2 whenever the request meets or exceeds the GPU's max texture size, and the force
+// shader clamps every point to [0, this] — so a seed sized for the wrong box pins nodes to the
+// walls (the "square"). We request 8191 to dodge that halving on 8192-maxTexture GPUs (see the
+// constructor comment), but still read the box LIVE here so the seed + gravity center match it on
+// any device (older GPUs, or if the requested value ever changes).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function effectiveSpace(g: any): number {
+  const s = g?.store?.adjustedSpaceSize;
+  return typeof s === 'number' && s > 0 ? s : 8192;
+}
+
 export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNode, focusNodes, layoutNonce = 0, colorVersion = 0, groupColoring, savedPositions, onPositionsSnapshot, onSelect, onHover }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -123,7 +134,14 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
         return;
       }
       graphRef.current = new gl.Graph(containerRef.current, {
-        spaceSize: 8192,
+        // 8191, NOT 8192 — deliberate. cosmos clamps every point into [0, spaceSize] and, when the
+        // requested spaceSize is >= the GPU's max texture size, SILENTLY halves the box to
+        // maxTextureSize/2. A request of 8192 on an 8192-maxTexture GPU (the common mobile /
+        // integrated case) collapses the box to 4096 — too small for the ~7k-span 23k invites graph,
+        // which then piles onto the walls as a hard square. 8191 is < 8192, so it dodges the halving
+        // and keeps a full ~8191 box on mobile (and 8191 on desktop's 16384 GPU too). Do not "round"
+        // it to 8192. The seed (see effectiveSpace) reads the resulting box so it stays contained.
+        spaceSize: 8191,
         backgroundColor: [0, 0, 0, 0],
         // Star-tuned forces. A 1-hop ego graph is a pure star, which at equilibrium
         // collapses into a tight dandelion — so we VARY link distances heavily
@@ -193,13 +211,16 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, routeNodes, routeEdges, focusNode, focusNodes, colorVersion]);
 
-  // Trust edges plus any route (flow) edges not already present — drawn as overlay links.
+  // Trust edges plus any route (flow) edges not already present — drawn as overlay links. A
+  // COLORED route edge (a realized-flow replay leg) is always appended so its own direction +
+  // issuer color render, even when a trust edge already connects the pair (possibly the other way);
+  // uncolored pay-corridor edges keep the dedup so they reuse the existing trust edge.
   function combinedEdges(): GraphEdge[] {
     const trust = graph.edges;
     const route = routeEdges ?? [];
     if (!route.length) return trust;
     const seen = new Set(trust.flatMap((e) => [`${e.source}>${e.target}`, `${e.target}>${e.source}`]));
-    return [...trust, ...route.filter((e) => !seen.has(`${e.source}>${e.target}`))];
+    return [...trust, ...route.filter((e) => e.color || !seen.has(`${e.source}>${e.target}`))];
   }
 
   function nodeColorsAndSizes() {
@@ -260,7 +281,15 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
     const colors = new Float32Array(m * 4);
     const widths = new Float32Array(m);
     const arrows: boolean[] = new Array(m).fill(false);
-    const routeSet = new Set((routeEdges ?? []).flatMap((e) => [`${e.source}>${e.target}`, `${e.target}>${e.source}`]));
+    // Per-edge route colors: a payment corridor defaults to coral (PATH_HEX); a realized-flow
+    // replay colors each leg by its token's issuer. Both directions map to the color so a flow leg
+    // matches a trust edge stored the other way round.
+    const routeColor = new Map<string, [number, number, number]>();
+    for (const e of routeEdges ?? []) {
+      const c: [number, number, number] = e.color ? rgb01(e.color) : ROUTE_RGB;
+      routeColor.set(`${e.source}>${e.target}`, c);
+      if (!routeColor.has(`${e.target}>${e.source}`)) routeColor.set(`${e.target}>${e.source}`, c);
+    }
     const hasRoute = !!routeNodes && routeNodes.size > 0;
     const hasFocus = !hasRoute && !!focusNode;
     const setEdge = (i: number, rgb: [number, number, number], a: number, w: number, arrow = false) => {
@@ -274,7 +303,8 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
     const GREY: [number, number, number] = [0.79, 0.78, 0.75];
     edges.forEach((e, i) => {
       if (hasRoute) {
-        if (routeSet.has(`${e.source}>${e.target}`)) setEdge(i, ROUTE_RGB, 1, 3.5, true);
+        const c = routeColor.get(`${e.source}>${e.target}`);
+        if (c) setEdge(i, c, 1, 3.5, true);
         else setEdge(i, GREY, 0.06, 1);
       } else if (hasFocus) {
         // Only the edges to freshly-pulled avatars light up — expand reads purely as the
@@ -444,10 +474,15 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
       : 0;
     const restore = relayout && nodes.length > 0 && restoreHits / nodes.length >= 0.8;
 
-    // Initial scatter radius for nodes with no prior position — scaled to graph size so a
-    // multi-thousand-node full network starts spread out (not a tight clump the sim must blow
-    // apart), while the ~220-node ego graph keeps its compact start.
-    const spread = Math.min(6500, Math.max(1200, Math.sqrt(nodes.length) * 90));
+    // Seed nodes with no prior position in a contained cloud centered in the REAL box (see
+    // effectiveSpace) — scaled to graph size so a multi-thousand-node network starts spread out
+    // (not a tight clump the sim must blow apart) while the ~220-node ego graph keeps its compact
+    // start. Spread is a FRACTION of the box: half-spread ≤ box·0.3 keeps every seed inside
+    // [0.2·box, 0.8·box], so nothing clamps onto the walls (the cause of the "square") — whatever
+    // box the device yields (~8191 on a typical 8192- or 16384-maxTexture GPU).
+    const box = effectiveSpace(g);
+    const center = box / 2;
+    const spread = Math.min(box * 0.6, Math.max(box * 0.16, Math.sqrt(nodes.length) * 90));
     const positions = new Float32Array(nodes.length * 2);
     nodes.forEach((node, i) => {
       const known = restore
@@ -471,8 +506,8 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
         positions[i * 2] = ax + (Math.random() - 0.5) * 300;
         positions[i * 2 + 1] = ay + (Math.random() - 0.5) * 300;
       } else {
-        positions[i * 2] = SPACE_CENTER + (Math.random() - 0.5) * spread;
-        positions[i * 2 + 1] = SPACE_CENTER + (Math.random() - 0.5) * spread;
+        positions[i * 2] = center + (Math.random() - 0.5) * spread;
+        positions[i * 2 + 1] = center + (Math.random() - 0.5) * spread;
       }
     });
 

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import type { GraphEdge } from '@/lib/ego-graph';
-import { extractFlowPath } from '@/lib/ego-graph';
+import { extractFlowPath, realizedFlow } from '@/lib/ego-graph';
 import {
   extractMemoFromInput,
   getTransactionHistory,
@@ -69,8 +69,16 @@ export function ActivityPanel({
         to: String(l.to ?? ''),
         tokenOwner: tokenIdToAddress(String(l.id ?? '')), // token id → issuer avatar address
       }));
-      const { participants, edges } = extractFlowPath(mapped, me, counterparty);
-      await onReplay(participants, edges, `${sent ? 'sent to' : 'received from'} ${shortenAddress(counterparty)}`);
+      // Show the REALIZED flow — every leg as a directed edge colored by token issuer — rather than
+      // collapsing it to the shortest trust corridor. Fall back to the corridor if the legs are
+      // unusable (e.g. all mint/router so no avatar-to-avatar edge survives).
+      const flow = realizedFlow(mapped);
+      const tokens = flow.tokenCount > 1 ? ` · ${flow.tokenCount} tokens` : '';
+      const { participants, edges } = flow.edges.length
+        ? { participants: [...new Set([me, counterparty.toLowerCase(), ...flow.participants])], edges: flow.edges }
+        : extractFlowPath(mapped, me, counterparty);
+      const label = `${sent ? 'sent to' : 'received from'} ${shortenAddress(counterparty)}${flow.edges.length ? tokens : ''}`;
+      await onReplay(participants, edges, label);
     } finally {
       setReplaying(null);
     }

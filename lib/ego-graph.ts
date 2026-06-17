@@ -15,6 +15,7 @@ import {
   type AggTrustRelation,
   type FlowTransfer,
 } from './circles-rpc';
+import { colorForAddress } from './avatar-style';
 
 /** Circles Hub v2 flow-matrix router — an intermediary in pathfinder output, not a real avatar. */
 export const ROUTER_ADDRESS = '0xdc287474114cc0551a81ddc2eb51783fbf34802f';
@@ -29,7 +30,9 @@ export type GraphNode = {
   isCenter?: boolean;
 };
 
-export type GraphEdge = { source: string; target: string };
+// `color` (hex) is set only on overlay edges that carry their own color — realized-flow replay
+// legs colored by token issuer. Trust edges and predicted pay corridors leave it unset.
+export type GraphEdge = { source: string; target: string; color?: string };
 
 export type Graph = { nodes: GraphNode[]; edges: GraphEdge[] };
 
@@ -323,6 +326,40 @@ export type FlowSummary = { participants: string[]; edges: GraphEdge[]; hops: nu
 export function summarizeFlow(transfers: FlowTransfer[], source: string, sink: string): FlowSummary {
   const { participants, edges } = extractFlowPath(transfers, source, sink);
   return { participants, edges, hops: Math.max(participants.length - 1, 0) };
+}
+
+/**
+ * Build the REALIZED token flow of a settled transaction for replay: every transfer leg becomes
+ * its own directed edge, colored by the token's issuer — so you see which token actually moved on
+ * each hop, rather than collapsing the whole flow matrix to one shortest corridor like
+ * {@link extractFlowPath}. Mint/burn (zero), router-hop, and self legs are dropped, and legs of the
+ * same token between the same pair are merged. `tokenCount` is how many distinct tokens moved.
+ */
+export function realizedFlow(legs: { from: string; to: string; tokenOwner: string }[]): {
+  participants: string[];
+  edges: GraphEdge[];
+  tokenCount: number;
+} {
+  const participants = new Set<string>();
+  const edges: GraphEdge[] = [];
+  const seen = new Set<string>();
+  const tokens = new Set<string>();
+  for (const l of legs) {
+    const from = norm(l.from);
+    const to = norm(l.to);
+    const owner = norm(l.tokenOwner);
+    if (from === to) continue;
+    if (from === ZERO_ADDRESS || to === ZERO_ADDRESS) continue;
+    if (from === ROUTER_ADDRESS || to === ROUTER_ADDRESS) continue;
+    participants.add(from);
+    participants.add(to);
+    tokens.add(owner);
+    const key = `${from}>${to}>${owner}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({ source: from, target: to, color: colorForAddress(owner) });
+  }
+  return { participants: [...participants], edges, tokenCount: tokens.size };
 }
 
 /**

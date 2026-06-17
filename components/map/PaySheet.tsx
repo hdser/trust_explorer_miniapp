@@ -198,10 +198,13 @@ export function PaySheet({
   async function handleSend() {
     if (!recipient) return;
     let atto: bigint;
-    // If the route can't carry the requested amount, send exactly what CAN flow (its max) so the
-    // user doesn't have to play guess-the-number — the max flow shifts with the requested amount.
+    // If the route can't carry the requested amount, send what CAN flow (its max) so the user
+    // doesn't have to play guess-the-number. Haircut the reported maxFlow by 3%: the pathfinder's
+    // maxFlow overshoots the actually-executable balance (demurrage + per-hop rounding), so sending
+    // it verbatim trips "Insufficient balance. Requested X, Available Y". The /available/ retry
+    // below still catches anything the haircut misses.
     if (route.kind === 'done' && !route.reachesTarget) {
-      atto = route.maxFlow;
+      atto = (route.maxFlow * 97n) / 100n;
     } else {
       try {
         atto = toAtto(amount);
