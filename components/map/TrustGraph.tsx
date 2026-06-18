@@ -77,10 +77,16 @@ const clamp = (lo: number, hi: number, v: number) => Math.max(lo, Math.min(hi, v
 // short network run length below) rather than letting it creep to the space boundary.
 function forcesNetwork(n: number) {
   return {
-    simulationRepulsion: clamp(1.4, 2.2, 9000 / n),
+    // Lower repulsion than before so the layout stays compact — the weakly-connected periphery
+    // (isolated mutual-trust pairs) doesn't get flung far out into a sprawling halo. Combined with
+    // the rescale guard + stop-on-bound below, the graph settles into a tight, contained cloud.
+    simulationRepulsion: clamp(0.9, 1.6, 6500 / n),
     simulationRepulsionTheta: 1.5,
-    // Gravity must stay low at scale: above ~0.025 a 20k-node graph forms a coincident core
-    // and runs away to a dot within seconds. This keeps even the largest graph spreading.
+    // Low gravity for a natural, spread-out layout. Containment is NOT handled by the forces (the
+    // equilibrium spread is wider than the box, and cranking gravity to fit just balls it into a
+    // hard disc) — instead the settle loop rescales the layout to fit the box (see settleMonitor),
+    // so it can never reach the walls to be clamped. That keeps containment independent of how fast
+    // the machine is or how long the sim runs.
     simulationGravity: clamp(0.018, 0.14, 430 / n),
     simulationCenter: 0,
     simulationLinkSpring: clamp(0.1, 0.3, 1200 / n),
@@ -236,11 +242,13 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
       let alpha = 1;
       let size: number;
       if (hasRoute) {
-        // Payment/convert route: coral corridor, everything else dimmed back.
+        // Payment/convert corridor OR a searched avatar's trust neighborhood: the highlighted nodes
+        // are coral, everything else dimmed back. The selected node (route target / searched avatar)
+        // is enlarged so it reads as the hub the in/out edges fan from.
         const onRoute = routeNodes?.has(node.id);
         rgb = onRoute ? ROUTE_RGB : node.isCenter ? CENTER_RGB : rgb01(TYPE_HEX[node.type] ?? TYPE_HEX.unknown);
         alpha = onRoute ? 1 : 0.1;
-        size = node.isCenter ? 18 : onRoute ? 13 : node.id === selectedId ? 13 : 5;
+        size = node.id === selectedId ? 18 : node.isCenter ? 18 : onRoute ? 11 : 5;
       } else if (hasFocus) {
         // Expand: the tapped avatar and its freshly-pulled trusts pop; the rest of the map
         // stays fully visible so you see the network *grow*, not a lone path.
@@ -373,8 +381,13 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
       monitorRef.current = null;
     }
     const POLL = 400;
-    const minMs = relayout ? 2400 : 1200;
-    const maxMs = relayout ? (n > NETWORK_THRESHOLD ? 16000 : 11000) : 5000;
+    // A high floor (`minMs`) so the under-load misfire can't stop early — per-poll movement looks
+    // tiny when few sim steps land between polls, falsely reading as "settled" → the square. The
+    // ceiling no longer has to guard against wall-drift (the rescale below does), so networks get a
+    // generous window to organize.
+    const isNetwork = relayout && n > NETWORK_THRESHOLD;
+    const minMs = isNetwork ? 9000 : relayout ? 2400 : 1200;
+    const maxMs = isNetwork ? 26000 : relayout ? 11000 : 5000;
     let last = (graphRef.current.getPointPositions() as number[]).slice();
     let elapsed = 0;
     let stable = 0;
@@ -415,10 +428,36 @@ export function TrustGraph({ graph, selectedId, routeNodes, routeEdges, focusNod
       }
       move = m ? move / m : 0;
       const span = Math.max(mxx - mnx, mxy - mny) || 1;
-      last = cur.slice();
-      // "Small change" ≈ avg node moved < ~1.5px on screen (span maps to ~700px on fit).
+
+      // CONTAINMENT: if the layout has grown past a safe margin of the box, scale every point toward
+      // the box center so it fits — so it can never reach the spaceSize walls to be clamped into a
+      // hard "cut" edge. This makes containment independent of machine speed / run length (forces
+      // alone can't guarantee it). Relative structure is preserved (uniform scale). `last` is reset
+      // to the rescaled coords so the jump isn't counted as node movement.
+      const box = effectiveSpace(g);
+      const margin = box * 0.08;
+      let boundHit = false;
+      if (m > 0 && (mnx < margin || mny < margin || mxx > box - margin || mxy > box - margin)) {
+        const center = box / 2;
+        const half = (box - 2 * margin) / 2;
+        const cx = (mnx + mxx) / 2, cy = (mny + mxy) / 2;
+        const s = Math.min(half / Math.max((mxx - mnx) / 2, 1), half / Math.max((mxy - mny) / 2, 1), 1);
+        const out = new Float32Array(cur.length);
+        for (let i = 0; i < cur.length; i += 2) {
+          out[i] = center + (cur[i] - cx) * s;
+          out[i + 1] = center + (cur[i + 1] - cy) * s;
+        }
+        try { g.setPointPositions(out, true); } catch { /* noop */ }
+        last = out as unknown as number[];
+        boundHit = true;
+      } else {
+        last = cur.slice();
+      }
+      // Stop once the layout has either truly settled (avg node moved < ~1.5px) OR has spread all the
+      // way to the containment bound — at that point it's fully expanded and only the rescale guard is
+      // keeping it in, so continuing just pumps it against the cap (reads as "expanding forever").
       const eps = Math.max(1.5, span / 450);
-      if (elapsed >= minMs && move < eps) stable++;
+      if (elapsed >= minMs && (move < eps || boundHit)) stable++;
       else stable = 0;
       if (stable >= 2 || elapsed >= maxMs) finish();
     }, POLL);

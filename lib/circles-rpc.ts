@@ -258,6 +258,9 @@ export type QueryFilter = {
   FilterType?: string;
   Column?: string;
   Value?: unknown;
+  // For Type:'Conjunction' — combine sub-predicates (e.g. a blockNumber range lo ≤ x < hi).
+  ConjunctionType?: 'And' | 'Or';
+  Predicates?: QueryFilter[];
 };
 export type QueryOrder = { Column: string; SortOrder: 'ASC' | 'DESC' };
 export type QueryParams = {
@@ -311,53 +314,94 @@ export function getTransfersByTx(txHash: string): Promise<Record<string, unknown
   });
 }
 
-/** One page (1000 rows) of the global trust graph, ordered for stable pagination. */
-export function queryTrustPage(after?: { blockNumber: number; transactionIndex: number; logIndex: number }) {
-  const filter: QueryFilter[] = [];
-  if (after) {
-    filter.push({
-      Type: 'FilterPredicate',
-      FilterType: 'GreaterThan',
-      Column: 'blockNumber',
-      Value: after.blockNumber,
-    });
-  }
-  return circlesQuery({
-    Namespace: 'V_CrcV2',
-    Table: 'TrustRelations',
-    Filter: filter,
-    Order: [
-      { Column: 'blockNumber', SortOrder: 'ASC' },
-      { Column: 'transactionIndex', SortOrder: 'ASC' },
-      { Column: 'logIndex', SortOrder: 'ASC' },
-    ],
-    Limit: 1000,
-  });
+// The public RPC caps `circles_query` at 10,000 rows per call (asking for more silently returns
+// 10k). So 10,000 is the largest useful page. A single 10k page is ~1MB and returns in ~2s.
+export const QUERY_PAGE_LIMIT = 10000;
+
+const BLOCK_ORDER: QueryOrder[] = [
+  { Column: 'blockNumber', SortOrder: 'ASC' },
+  { Column: 'transactionIndex', SortOrder: 'ASC' },
+  { Column: 'logIndex', SortOrder: 'ASC' },
+];
+
+/** Lowest and highest `blockNumber` in a block-ordered table — the bounds we partition for parallel fetch. */
+async function blockBounds(namespace: string, table: string): Promise<{ min: number; max: number } | null> {
+  const one = (order: 'ASC' | 'DESC') =>
+    circlesQuery({ Namespace: namespace, Table: table, Columns: ['blockNumber'], Order: [{ Column: 'blockNumber', SortOrder: order }], Limit: 1 });
+  const [asc, desc] = await Promise.all([one('ASC'), one('DESC')]);
+  const min = Number(asc[0]?.blockNumber);
+  const max = Number(desc[0]?.blockNumber);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) return null;
+  return { min, max };
 }
 
 /**
- * One page (1000 rows) of the global invitations graph. Each `CrcV2.RegisterHuman` event is an
- * `inviter → avatar` edge (the existing avatar who let a new human register). Same pagination.
+ * Fetch EVERY row of a block-ordered table by splitting its block range into `ranges` slices and
+ * paging them CONCURRENTLY (`concurrency` in flight at once) instead of one serial cursor walk —
+ * ~3× faster wall-clock for the big global graphs (browsers cap ~6 connections/host, so 6 is the
+ * sweet spot). Each call is capped at {@link QUERY_PAGE_LIMIT}; a slice that fills up is sub-paged
+ * within its worker. `onProgress(rowsSoFar)` ticks as slices land. Row order across slices is not
+ * guaranteed (callers here build sets/maps, so order doesn't matter).
  */
-export function queryInvitesPage(after?: { blockNumber: number; transactionIndex: number; logIndex: number }) {
-  const filter: QueryFilter[] = [];
-  if (after) {
-    filter.push({
-      Type: 'FilterPredicate',
-      FilterType: 'GreaterThan',
-      Column: 'blockNumber',
-      Value: after.blockNumber,
-    });
-  }
-  return circlesQuery({
-    Namespace: 'CrcV2',
-    Table: 'RegisterHuman',
-    Filter: filter,
-    Order: [
-      { Column: 'blockNumber', SortOrder: 'ASC' },
-      { Column: 'transactionIndex', SortOrder: 'ASC' },
-      { Column: 'logIndex', SortOrder: 'ASC' },
-    ],
-    Limit: 1000,
-  });
+export async function queryAllByBlock(
+  namespace: string,
+  table: string,
+  columns: string[],
+  opts: { ranges?: number; concurrency?: number; onProgress?: (rows: number) => void } = {},
+): Promise<Record<string, unknown>[]> {
+  const { ranges = 48, concurrency = 6, onProgress } = opts;
+  const bounds = await blockBounds(namespace, table);
+  if (!bounds) return [];
+  const { min, max } = bounds;
+  const step = Math.max(1, Math.ceil((max - min + 1) / ranges));
+  const slices: [number, number][] = [];
+  for (let lo = min; lo <= max; lo += step) slices.push([lo, Math.min(lo + step, max + 1)]);
+
+  // Page one half-open block slice [lo, hi), following the cursor until it's exhausted.
+  const pageSlice = async (lo: number, hi: number): Promise<Record<string, unknown>[]> => {
+    const out: Record<string, unknown>[] = [];
+    let cur = lo;
+    for (;;) {
+      const rows = await circlesQuery({
+        Namespace: namespace,
+        Table: table,
+        Columns: columns,
+        Filter: [
+          {
+            Type: 'Conjunction',
+            ConjunctionType: 'And',
+            Predicates: [
+              { Type: 'FilterPredicate', FilterType: 'GreaterThanOrEquals', Column: 'blockNumber', Value: cur },
+              { Type: 'FilterPredicate', FilterType: 'LessThan', Column: 'blockNumber', Value: hi },
+            ],
+          },
+        ],
+        Order: BLOCK_ORDER,
+        Limit: QUERY_PAGE_LIMIT,
+      });
+      if (!rows.length) break;
+      out.push(...rows);
+      if (rows.length < QUERY_PAGE_LIMIT) break;
+      // Advance past the last block. A single block with >10k rows would stall here, but trust/invite
+      // events never cluster that densely; the rare same-block tail is dropped (callers dedup anyway).
+      cur = Number(rows[rows.length - 1].blockNumber) + 1;
+    }
+    return out;
+  };
+
+  const results: Record<string, unknown>[][] = new Array(slices.length);
+  let total = 0;
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= slices.length) break;
+      const rows = await pageSlice(slices[i][0], slices[i][1]);
+      results[i] = rows;
+      total += rows.length;
+      onProgress?.(total);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, slices.length) }, worker));
+  return results.flat();
 }

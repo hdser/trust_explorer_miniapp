@@ -9,8 +9,7 @@ import {
   getAggregatedTrustRelations,
   getAvatarInfoBatch,
   getProfileByAddressBatch,
-  queryTrustPage,
-  queryInvitesPage,
+  queryAllByBlock,
   ZERO_ADDRESS,
   type AggTrustRelation,
   type FlowTransfer,
@@ -34,7 +33,11 @@ export type GraphNode = {
 // legs colored by token issuer. Trust edges and predicted pay corridors leave it unset.
 export type GraphEdge = { source: string; target: string; color?: string };
 
-export type Graph = { nodes: GraphNode[]; edges: GraphEdge[] };
+// `meta.relations` is the REAL number of relationships in the scope (e.g. the full ~380k v2 trusts),
+// which can exceed `edges.length` when the renderer is handed a reduced/degree-capped subset. The
+// header reads it for the "N avatars · M trusts" count so the figure reflects the true network, not
+// what was drawn. Loaders that render every edge can leave it unset (the header falls back to edges).
+export type Graph = { nodes: GraphNode[]; edges: GraphEdge[]; meta?: { relations: number } };
 
 const norm = (a: string) => a.toLowerCase();
 
@@ -229,7 +232,7 @@ export async function mergeAddresses(graph: Graph, addresses: string[]): Promise
     }
   }
   if (added.size) await enrich(added);
-  return { nodes: [...nodes.values()], edges: graph.edges };
+  return { nodes: [...nodes.values()], edges: graph.edges, meta: graph.meta };
 }
 
 /**
@@ -363,94 +366,82 @@ export function realizedFlow(legs: { from: string; to: string; tokenOwner: strin
 }
 
 /**
- * Page the entire global V2 trust graph via `circles_query`. Heavy — opt-in only.
- * Calls `onProgress` after each page so the UI can show how far it's gotten.
+ * Load the ENTIRE global v2 trust graph. Heavy — opt-in only.
  *
- * Only **v2 avatars** are kept: emitting a CrcV2 trust requires being a registered v2
- * avatar, so every `truster` is a v2 avatar. We keep a trustee only if it is itself a
- * truster — i.e. also a v2 avatar — which drops non-v2 / unregistered trustee addresses.
+ * The node set is the authoritative v2 avatar list (`V_CrcV2.Avatars`), which also carries each
+ * avatar's `type` — so we color the map immediately, with NO follow-up type enrichment. Edges are
+ * every current v2 trust relation (`V_CrcV2.TrustRelations`): the truster is always a v2 avatar (you
+ * must be registered to emit a CrcV2 trust), and we keep an edge only when the trustee is a v2 avatar
+ * too. Both tables are fetched CONCURRENTLY by block range ({@link queryAllByBlock}); the trust set
+ * is ~400k rows / ~40MB, so it's the heavy one and drives `onProgress`.
  */
-export async function loadFullNetwork(
-  onProgress?: (edgeCount: number) => void,
-  maxPages = 60,
-): Promise<Graph> {
-  const rawEdges: [string, string][] = [];
-  const trusters = new Set<string>();
-  let after: { blockNumber: number; transactionIndex: number; logIndex: number } | undefined;
-
-  for (let page = 0; page < maxPages; page++) {
-    const rows = await queryTrustPage(after);
-    if (!rows.length) break;
-    for (const row of rows) {
-      const trustee = norm(String(row.trustee));
-      const truster = norm(String(row.truster));
-      if (trustee === ZERO_ADDRESS || truster === ZERO_ADDRESS || trustee === truster) continue;
-      trusters.add(truster);
-      rawEdges.push([truster, trustee]);
-    }
-    onProgress?.(rawEdges.length);
-    const last = rows[rows.length - 1];
-    after = {
-      blockNumber: Number(last.blockNumber),
-      transactionIndex: Number(last.transactionIndex),
-      logIndex: Number(last.logIndex),
-    };
-    if (rows.length < 1000) break;
+export async function loadFullNetwork(onProgress?: (edgeCount: number) => void): Promise<Graph> {
+  // 1) v2 avatar node set, typed inline (small + fast — load first so we can filter edges against it).
+  const avatarRows = await queryAllByBlock('V_CrcV2', 'Avatars', ['avatar', 'type'], { ranges: 16 });
+  const typeOf = new Map<string, AvatarType>();
+  for (const r of avatarRows) {
+    const a = norm(String(r.avatar));
+    if (a && a !== ZERO_ADDRESS) typeOf.set(a, avatarTypeFrom(String(r.type ?? '')));
   }
 
+  // 2) Every v2 trust relation, fetched concurrently.
+  const trustRows = await queryAllByBlock('V_CrcV2', 'TrustRelations', ['truster', 'trustee'], { ranges: 64, onProgress });
+
+  // Keep every v2-to-v2 trust edge as directed presence, and collect the node set (typed inline).
   const nodes = new Map<string, GraphNode>();
-  const edges: GraphEdge[] = [];
-  const seenEdge = new Set<string>();
-  for (const [truster, trustee] of rawEdges) {
-    if (!trusters.has(trustee)) continue; // trustee isn't a v2 avatar (never trusts) — drop it
-    if (!nodes.has(truster)) nodes.set(truster, { id: truster, type: 'unknown' });
-    if (!nodes.has(trustee)) nodes.set(trustee, { id: trustee, type: 'unknown' });
-    const key = `${truster}>${trustee}`;
-    if (!seenEdge.has(key)) {
-      seenEdge.add(key);
-      edges.push({ source: truster, target: trustee });
-    }
+  const ensure = (id: string) => {
+    if (!nodes.has(id)) nodes.set(id, { id, type: typeOf.get(id) ?? 'unknown' });
+  };
+  const directed = new Set<string>(); // `truster>trustee`
+  for (const row of trustRows) {
+    const truster = norm(String(row.truster));
+    const trustee = norm(String(row.trustee));
+    if (truster === ZERO_ADDRESS || trustee === ZERO_ADDRESS || truster === trustee) continue;
+    // v2-ONLY: keep an edge only when BOTH ends are registered v2 avatars (in V_CrcV2.Avatars).
+    // The truster always is (emitting a CrcV2 trust requires registration — verified: 0 exceptions),
+    // but ~1,270 trustees are addresses trusted before/without registering; we drop those.
+    if (!typeOf.has(truster) || !typeOf.has(trustee)) continue;
+    ensure(truster);
+    ensure(trustee);
+    directed.add(`${truster}>${trustee}`);
   }
 
-  return { nodes: [...nodes.values()], edges };
+  // Render the FULL trust topology, only de-duplicated: collapse each reciprocal pair (A trusts B
+  // AND B trusts A) into one undirected edge so we don't draw doubles. Keeping every edge is what
+  // preserves the community structure — a per-node degree cap flattened it into a featureless blob.
+  // The longer, misfire-proof settle (see settleMonitor) is what lets the force layout organize this
+  // density into clusters instead of stalling as a square.
+  const seenPair = new Set<string>();
+  const edges: GraphEdge[] = [];
+  for (const k of directed) {
+    const sep = k.indexOf('>');
+    const a = k.slice(0, sep);
+    const b = k.slice(sep + 1);
+    const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+    if (seenPair.has(key)) continue;
+    seenPair.add(key);
+    edges.push({ source: a, target: b });
+  }
+  // `relations` = the true count of v2 trust relations (directed), shown in the header.
+  return { nodes: [...nodes.values()], edges, meta: { relations: directed.size } };
 }
 
 /**
- * Page the entire global **invitations** graph: `CrcV2.RegisterHuman` events, each an
- * `inviter → invitee` edge. Heavy — opt-in like {@link loadFullNetwork}. Both ends are humans
- * (only registered avatars invite, and the registrant is a human), so we type them 'human' —
- * that colors the map without the cost of enriching thousands of profiles.
+ * Load the entire global **invitations** graph: `CrcV2.RegisterHuman` events, each an
+ * `inviter → invitee` edge. Fetched concurrently by block range like {@link loadFullNetwork}. Both
+ * ends are humans (only registered avatars invite, and the registrant is a human), so we type them
+ * 'human' — that colors the map without enriching thousands of profiles.
  */
-export async function loadInvitesNetwork(
-  onProgress?: (edgeCount: number) => void,
-  maxPages = 60,
-): Promise<Graph> {
-  const rawEdges: [string, string][] = [];
-  let after: { blockNumber: number; transactionIndex: number; logIndex: number } | undefined;
-
-  for (let page = 0; page < maxPages; page++) {
-    const rows = await queryInvitesPage(after);
-    if (!rows.length) break;
-    for (const row of rows) {
-      const inviter = norm(String(row.inviter));
-      const invitee = norm(String(row.avatar));
-      if (inviter === ZERO_ADDRESS || invitee === ZERO_ADDRESS || inviter === invitee) continue;
-      rawEdges.push([inviter, invitee]);
-    }
-    onProgress?.(rawEdges.length);
-    const last = rows[rows.length - 1];
-    after = {
-      blockNumber: Number(last.blockNumber),
-      transactionIndex: Number(last.transactionIndex),
-      logIndex: Number(last.logIndex),
-    };
-    if (rows.length < 1000) break;
-  }
+export async function loadInvitesNetwork(onProgress?: (edgeCount: number) => void): Promise<Graph> {
+  const rows = await queryAllByBlock('CrcV2', 'RegisterHuman', ['inviter', 'avatar'], { ranges: 24, onProgress });
 
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const seenEdge = new Set<string>();
-  for (const [inviter, invitee] of rawEdges) {
+  for (const row of rows) {
+    const inviter = norm(String(row.inviter));
+    const invitee = norm(String(row.avatar));
+    if (inviter === ZERO_ADDRESS || invitee === ZERO_ADDRESS || inviter === invitee) continue;
     if (!nodes.has(inviter)) nodes.set(inviter, { id: inviter, type: 'human' });
     if (!nodes.has(invitee)) nodes.set(invitee, { id: invitee, type: 'human' });
     const key = `${inviter}>${invitee}`;

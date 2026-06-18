@@ -10,9 +10,9 @@ or group membership.
 
 ## Features
 
-- **My Network** — your 1-hop trust neighbourhood; tap any avatar to grow the map outward (new avatars pop in).
-- **Circles Network** — the whole global trust graph (opt-in; paged from the RPC, ~5k avatars).
-- **Invitation Graph** — who invited whom across Circles.
+- **Vicinity** — your 1-hop trust neighbourhood; tap any avatar to grow the map outward (new avatars pop in).
+- **Network** — the whole global trust graph (opt-in; paged from the RPC, ~5k avatars).
+- **Invitation** — who invited whom across Circles.
 - **Send or convert** — pay anyone along trust paths with selectable send/receive tokens, or convert your own
   token A → B. The route lights up on the map with max-flow amount + hop count; execution is signed by the host.
 - **Activity & flow replay** — your transaction history, and a replay of how a past payment actually moved.

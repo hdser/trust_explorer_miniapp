@@ -21,6 +21,10 @@ export const PATH_HEX = '#D85A30';
 /** Avatars freshly pulled in by tapping "Expand" — they pop on the map as the network grows. */
 export const NEW_HEX = '#DB2777';
 
+/** Neighborhood highlight (search): outgoing trust (this avatar → others) vs incoming (others → it). */
+export const TRUST_OUT_HEX = '#2563EB'; // blue — avatars this one trusts
+export const TRUST_IN_HEX = '#E0701E'; // orange — avatars that trust this one
+
 /**
  * Distinct hues assigned to the groups picked in "color by group" mode — chosen to read clearly
  * against each other and to avoid clashing with the type/center/route/new colors above.

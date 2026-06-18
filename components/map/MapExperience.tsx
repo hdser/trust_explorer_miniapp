@@ -13,8 +13,15 @@ import {
   type GraphEdge,
   type GraphNode,
 } from '@/lib/ego-graph';
-import { getGroupMembers, getProfileByAddress, getTokenBalances, type GroupInfo } from '@/lib/circles-rpc';
-import { GROUP_PALETTE, TYPE_HEX } from '@/lib/avatar-style';
+import {
+  getAggregatedTrustRelations,
+  getGroupMembers,
+  getProfileByAddress,
+  getTokenBalances,
+  ZERO_ADDRESS,
+  type GroupInfo,
+} from '@/lib/circles-rpc';
+import { GROUP_PALETTE, TRUST_IN_HEX, TRUST_OUT_HEX, TYPE_HEX } from '@/lib/avatar-style';
 import { shortenAddress } from '@/lib/utils';
 import { TrustGraph } from './TrustGraph';
 import { AvatarSheet } from './AvatarSheet';
@@ -23,7 +30,7 @@ import { ActivityPanel } from './ActivityPanel';
 import { ColorSheet, type ColorMode } from './ColorSheet';
 import { SearchSheet } from './SearchSheet';
 
-type Route = { nodes: Set<string>; edges: GraphEdge[]; label: string };
+type Route = { nodes: Set<string>; edges: GraphEdge[]; label: string; legend?: { color: string; label: string }[] };
 type Panel = 'none' | 'avatar' | 'pay' | 'activity' | 'color' | 'search';
 type SelectedGroup = { address: string; name: string; symbol?: string; color: string };
 
@@ -31,9 +38,9 @@ type SelectedGroup = { address: string; name: string; symbol?: string; color: st
 // other two are the whole global graph for a relation, like the web_viewer's graph picker.
 type Scope = 'ego' | 'trusts' | 'invites';
 const SCOPES: { id: Scope; short: string; label: string }[] = [
-  { id: 'ego', short: 'My Network', label: 'Your trust neighbourhood (tap a node to grow it)' },
-  { id: 'trusts', short: 'Circles Network', label: 'The whole Circles trust network' },
-  { id: 'invites', short: 'Invitation Graph', label: 'Who invited whom across Circles' },
+  { id: 'ego', short: 'Vicinity', label: 'Your trust neighbourhood (tap a node to grow it)' },
+  { id: 'trusts', short: 'Network', label: 'The whole Circles trust network' },
+  { id: 'invites', short: 'Invitation', label: 'Who invited whom across Circles' },
 ];
 
 const LEGEND: { type: keyof typeof TYPE_HEX; label: string }[] = [
@@ -170,13 +177,13 @@ export function MapExperience() {
   }, []);
 
   const applyRoute = useCallback(
-    async (participants: string[], edges: GraphEdge[], label: string) => {
+    async (participants: string[], edges: GraphEdge[], label: string, legend?: { color: string; label: string }[]) => {
       if (!graph) return;
       const merged = await mergeAddresses(graph, participants);
       graphCache.current[scopeRef.current] = merged;
       setGraph(merged);
       setFocus(null);
-      setRoute({ nodes: new Set(participants.map((p) => p.toLowerCase())), edges, label });
+      setRoute({ nodes: new Set(participants.map((p) => p.toLowerCase())), edges, label, legend });
     },
     [graph],
   );
@@ -206,16 +213,48 @@ export function MapExperience() {
     setColorVersion((v) => v + 1);
   }
 
-  // Search-select: place the avatar on the map (added + highlighted) and open its profile.
-  // From the profile sheet the user can Expand its network or Send to it.
+  // Search-select: place the avatar on the map and HIGHLIGHT its trust neighborhood — outgoing
+  // (avatars it trusts, blue) and incoming (avatars that trust it, orange) — as directed edges, with
+  // the rest of the map dimmed. Then open its profile (Expand / Send from there). Uses the complete
+  // aggregated relations, so it works for any address regardless of the current scope.
+  const NEIGHBORHOOD_CAP = 600; // bound extreme hubs (most avatars fall well under this)
   async function handleSearchSelect(addr: string, name?: string) {
     if (!graph) return;
     const a = addr.toLowerCase();
-    const merged = await mergeAddresses(graph, [a]);
-    graphCache.current[scopeRef.current] = merged;
-    setRoute(null);
-    setGraph(merged);
-    setFocus({ node: a, added: new Set(), label: name ?? shortenAddress(a) });
+    setSelectedId(a);
+    const rels = await getAggregatedTrustRelations(a).catch(() => []);
+    const outSet = new Set<string>();
+    const inSet = new Set<string>();
+    for (const r of rels) {
+      const o = r.objectAvatar.toLowerCase();
+      if (o === ZERO_ADDRESS || o === a) continue;
+      if (r.relation === 'trusts' || r.relation === 'mutuallyTrusts') outSet.add(o);
+      if (r.relation === 'trustedBy' || r.relation === 'mutuallyTrusts') inSet.add(o);
+    }
+    const out = [...outSet].slice(0, NEIGHBORHOOD_CAP);
+    const inc = [...inSet].slice(0, NEIGHBORHOOD_CAP);
+
+    if (!out.length && !inc.length) {
+      // No trust relations — just place + focus the single node.
+      const merged = await mergeAddresses(graph, [a]);
+      graphCache.current[scopeRef.current] = merged;
+      setRoute(null);
+      setGraph(merged);
+      setFocus({ node: a, added: new Set(), label: name ?? shortenAddress(a) });
+      setPanel('avatar');
+      return;
+    }
+
+    const participants = [a, ...out, ...inc];
+    const edges: GraphEdge[] = [
+      ...out.map((o) => ({ source: a, target: o, color: TRUST_OUT_HEX })),
+      ...inc.map((i) => ({ source: i, target: a, color: TRUST_IN_HEX })),
+    ];
+    const label = `${name ?? shortenAddress(a)} — trusts ${outSet.size}, trusted by ${inSet.size}`;
+    await applyRoute(participants, edges, label, [
+      { color: TRUST_OUT_HEX, label: 'trusts' },
+      { color: TRUST_IN_HEX, label: 'trusted by' },
+    ]);
     setSelectedId(a);
     setPanel('avatar');
   }
@@ -296,6 +335,13 @@ export function MapExperience() {
   const balanceText =
     meBalance != null ? Number(meBalance).toLocaleString(undefined, { maximumFractionDigits: 0 }) : null;
 
+  // Always-on count: avatars (nodes) and relationships. For trust scopes `meta.relations` carries the
+  // TRUE trust count (the Network renderer only draws a degree-capped subset); invitations have no
+  // reduction, so it falls back to the edge count.
+  const avatarCount = graph?.nodes.length ?? 0;
+  const relationCount = graph?.meta?.relations ?? graph?.edges.length ?? 0;
+  const relationLabel = scope === 'invites' ? 'invites' : 'trusts';
+
   const groupColoring =
     colorMode === 'group' && selectedGroups.length
       ? {
@@ -367,6 +413,12 @@ export function MapExperience() {
           {load && (
             <span className="rounded-full border bg-card/90 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
               {load.progress > 0 ? `Loading… ${load.progress.toLocaleString()} edges` : 'Loading…'}
+            </span>
+          )}
+          {graph && !load && (
+            <span className="rounded-full border bg-card/90 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur">
+              <span className="font-medium text-foreground">{avatarCount.toLocaleString()}</span> avatars ·{' '}
+              <span className="font-medium text-foreground">{relationCount.toLocaleString()}</span> {relationLabel}
             </span>
           )}
         </div>
@@ -510,12 +562,21 @@ export function MapExperience() {
         </div>
       )}
 
-      {/* Route / expand label */}
+      {/* Route / expand label (+ legend for the search neighborhood's in/out edge colors) */}
       {(route || focus) && panel === 'none' && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-16 z-10 flex justify-center">
+        <div className="pointer-events-none absolute inset-x-0 bottom-16 z-10 flex flex-wrap items-center justify-center gap-1.5">
           <span className="rounded-full bg-card/90 px-3 py-1 text-xs text-muted-foreground shadow-sm backdrop-blur">
             {route?.label ?? focus?.label}
           </span>
+          {route?.legend?.map((l) => (
+            <span
+              key={l.label}
+              className="flex items-center gap-1 rounded-full bg-card/90 px-2.5 py-1 text-xs text-muted-foreground shadow-sm backdrop-blur"
+            >
+              <span className="h-2 w-2 rounded-full" style={{ backgroundColor: l.color }} />
+              {l.label}
+            </span>
+          ))}
         </div>
       )}
 
